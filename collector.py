@@ -8,6 +8,9 @@ import yaml
 import shutil
 import argparse
 import os
+import subprocess
+import sys
+import signal
 from tqdm import tqdm
 
 FPS = 10
@@ -72,8 +75,6 @@ def parse_args():
     parser.add_argument('--output', type=str, default='/Marsupium/marathon.hdf5', help='Final HDF5 output file path')
     parser.add_argument('--temp', type=str, default='/Marsupium/sprint.hdf5', help='Temporary HDF5 path for intermediate storage')
     parser.add_argument('--no-progress', action='store_true', help='Disable tqdm progress bars for supervised runs')
-    parser.add_argument('--no_vehicles', type=int, default=10, help='Number of Vehicles')
-    parser.add_argument('--no_walkers', type=int, default=10, help='Number of Walkers')
     return parser.parse_args()
 
 def save_data_hdf5(file, run, actor, ego, data):
@@ -141,25 +142,14 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
     if any(s is None for s in sensors):
         raise RuntimeError("Failed to spawn one or more sensors.")
     
-    vehicles = []
-    for _ in range(args.no_vehicles):
-        vehicle = spawn_vehicle_or_walker(world, blueprint_library, random.choice(world.get_blueprint_library().filter('*vehicle*')))
-        vehicles.append(vehicle)
-    if any(v is None for v in vehicles):
-        raise RuntimeError("Failed to spawn one or more vehicles.")
-
-    walkers = []
-    for _ in range(args.no_walkers):
-        walker = spawn_vehicle_or_walker(world, blueprint_library, random.choice(world.get_blueprint_library().filter('*walker*')))
-        walkers.append(walker)
-    if any(w is None for w in walkers):
-        raise RuntimeError("Failed to spawn one or more walkers.")
+    actors = world.get_actors()
+    vehicles = actors.filter('*vehicle*')
+    walkers = actors.filter('*walker*')
     
     try:
         with CarlaSyncMode(world, *sensors, fps=FPS) as sync_mode:
             sync_mode.tick(timeout=2.0)
             ego.set_autopilot(True)
-            # TODO: set autopilot
             loop = range(FPS * args.duration)
             if not args.no_progress:
                 loop = tqdm(loop, desc=f"Run {run_no}")
@@ -222,7 +212,7 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
                     i += 1               
 
     finally:
-        for actor in [ego] + sensors + vehicles + walkers:
+        for actor in [ego] + sensors:
             try:
                 if actor is not None and actor.is_alive:
                     actor.destroy()
@@ -244,7 +234,7 @@ def main():
         sensor_config = yaml.safe_load(file)
 
     try:
-        client = carla.Client('169.254.186.128', 2000)
+        client = carla.Client('192.168.212.250', 2000)
         client.set_timeout(10.0)
         # world = client.load_world(args.map)
         world = client.get_world()
@@ -252,19 +242,55 @@ def main():
         blueprint_library = world.get_blueprint_library()
 
         for run_no in range(1, args.runs + 1):
+            traffic_proc = None
             try:
-                collect_data(world, tm, blueprint_library, run_no, args, sensor_config)
-                os.remove(args.output)
-                shutil.copy(args.temp, args.output)
-                print(f"[INFO] Marathon updated: {args.output}")
+                # Start traffic generator as a subprocess for this run
+                gen_script = 'python generate_traffic.py --asynch'
+                try:
+                    traffic_proc = subprocess.Popen(gen_script, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    print(f"[INFO] Started traffic generator (pid={traffic_proc.pid}) for run {run_no}")
+                except Exception as e:
+                    print(f"[WARN] Could not start traffic generator: {e}")
+                    traffic_proc = None
 
-                if run_no % 10 == 0:
-                    pass
+                collect_data(world, tm, blueprint_library, run_no, args, sensor_config)
+
+                # Update main output with this run's temp file
+                if os.path.exists(args.output):
+                    try:
+                        os.remove(args.output)
+                    except Exception as e:
+                        print(f"[WARN] Failed to remove existing output {args.output}: {e}")
+                try:
+                    shutil.copy(args.temp, args.output)
+                    print(f"[INFO] Marathon updated: {args.output}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to copy temp to output: {e}")
 
             except Exception as e:
                 print(f"Run {run_no} failed: {e}")
                 with open("failed_runs.log", "a") as log:
                     log.write(f"Run {run_no} failed: {e}\n")
+                    
+            finally:
+                # Ensure traffic generator subprocess is stopped after each run
+                if traffic_proc is not None:
+                    try:
+                        # try a graceful interrupt first
+                        traffic_proc.send_signal(signal.SIGINT)
+                        traffic_proc.wait(timeout=10)
+                        print(f"[INFO] Traffic generator (pid={traffic_proc.pid}) stopped gracefully")
+                    except Exception:
+                        try:
+                            traffic_proc.terminate()
+                            traffic_proc.wait(timeout=10)
+                            print(f"[INFO] Traffic generator (pid={traffic_proc.pid}) terminated")
+                        except Exception:
+                            try:
+                                traffic_proc.kill()
+                                print(f"[INFO] Traffic generator (pid={traffic_proc.pid}) killed")
+                            except Exception as e:
+                                print(f"[WARN] Failed to kill traffic generator: {e}")
     finally:
         print("Shutdown complete.")
 
