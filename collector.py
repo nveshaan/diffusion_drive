@@ -175,7 +175,7 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
 
                 velocity = ego.get_velocity()
                 acceleration = ego.get_acceleration()
-                location, rotation = ego.get_transform()
+                location, rotation = ego.get_transform().location, ego.get_transform().rotation
                 control = ego.get_control()
                 command, waypoint = tm.get_next_action(ego)
                 command = COMMAND_MAP.get(str(command).upper(), -1)
@@ -195,7 +195,7 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
                 for vehicle in vehicles:
                     velocity = vehicle.get_velocity()
                     acceleration = vehicle.get_acceleration()
-                    location, rotation = vehicle.get_transform()
+                    location, rotation = vehicle.get_transform().location, vehicle.get_transform().rotation
                     extent = vehicle.bounding_box.extent
 
                     data = [[velocity.x, velocity.y, velocity.z],
@@ -211,7 +211,7 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
                 for walker in walkers:
                     velocity = walker.get_velocity()
                     acceleration = walker.get_acceleration()
-                    location, rotation = walker.get_transform()
+                    location, rotation = walker.get_transform().location, walker.get_transform().rotation
 
                     data = [[velocity.x, velocity.y, velocity.z],
                             [acceleration.x, acceleration.y, acceleration.z],
@@ -244,7 +244,7 @@ def main():
         sensor_config = yaml.safe_load(file)
 
     try:
-        client = carla.Client('192.168.212.250', 2000)
+        client = carla.Client('169.254.186.128', 2000)
         client.set_timeout(10.0)
         # world = client.load_world(args.map)
         world = client.get_world()
