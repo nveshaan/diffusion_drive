@@ -69,10 +69,10 @@ def parse_args():
     parser.add_argument('--runs', type=int, default=100, help='Number of runs to perform')
     parser.add_argument('--map', type=str, default='Town10', help='CARLA map name')
     parser.add_argument('--vehicle', type=str, default='vehicle.nissan.patrol', help='Vehicle blueprint ID')
-    parser.add_argument('--output', type=str, default='marathon.hdf5', help='Final HDF5 output file path')
-    parser.add_argument('--temp', type=str, default='sprint.hdf5', help='Temporary HDF5 path for intermediate storage')
+    parser.add_argument('--output', type=str, default='/Marsupium/marathon.hdf5', help='Final HDF5 output file path')
+    parser.add_argument('--temp', type=str, default='/Marsupium/sprint.hdf5', help='Temporary HDF5 path for intermediate storage')
     parser.add_argument('--no-progress', action='store_true', help='Disable tqdm progress bars for supervised runs')
-    parser.add_argument('--no_vehicles', type=int, default=30, help='Number of Vehicles')
+    parser.add_argument('--no_vehicles', type=int, default=10, help='Number of Vehicles')
     parser.add_argument('--no_walkers', type=int, default=10, help='Number of Walkers')
     return parser.parse_args()
 
@@ -81,9 +81,9 @@ def save_data_hdf5(file, run, actor, ego, data):
         with h5py.File(file, 'a') as f:
             run_group = f.require_group(f"runs/{run}")
             vehicle_group = run_group.require_group(f"{actor}/{ego}")
-            if ego is 'ego':
+            if ego == 'ego':
                 dataset_names = ["image", "laser", "velocity", "acceleration", "location", "rotation", "control", "command"]
-            elif actor is 'vehicles':
+            elif actor == 'vehicles':
                 dataset_names = ["velocity", "acceleration", "location", "rotation", "extent"]
             else:
                 dataset_names = ["velocity", "acceleration", "location", "rotation"]
@@ -130,11 +130,10 @@ def spawn_sensors(world, blueprint_library, config, vehicles):
 
 def spawn_vehicle_or_walker(world, blueprint_library, type):
     spawn_point = random.choice(world.get_map().get_spawn_points())
-    bp = blueprint_library.find(type)
-    return world.try_spawn_actor(bp, spawn_point)
+    return world.spawn_actor(type, spawn_point)
 
 def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
-    ego = spawn_vehicle_or_walker(world, blueprint_library, args.vehicle)
+    ego = spawn_vehicle_or_walker(world, blueprint_library, blueprint_library.find(args.vehicle))
     if ego is None:
         raise RuntimeError("Failed to spawn vehicle.")
 
@@ -160,7 +159,7 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
         with CarlaSyncMode(world, *sensors, fps=FPS) as sync_mode:
             sync_mode.tick(timeout=2.0)
             ego.set_autopilot(True)
-
+            # TODO: set autopilot
             loop = range(FPS * args.duration)
             if not args.no_progress:
                 loop = tqdm(loop, desc=f"Run {run_no}")
@@ -241,22 +240,23 @@ def main():
         print("Removing existing temporary HDF5 file...")
         os.remove(args.temp)
 
-    with open('configs/sensor_config.yaml', 'r') as file:
+    with open('sensor_config.yaml', 'r') as file:
         sensor_config = yaml.safe_load(file)
 
     try:
-        client = carla.Client('localhost', 2000)
+        client = carla.Client('192.168.212.250', 2000)
         client.set_timeout(10.0)
-        world = client.load_world(args.map)
+        # world = client.load_world(args.map)
+        world = client.get_world()
         tm = client.get_trafficmanager()
         blueprint_library = world.get_blueprint_library()
 
         for run_no in range(1, args.runs + 1):
             try:
                 collect_data(world, tm, blueprint_library, run_no, args, sensor_config)
-                backup_name = f"backup_run_{run_no}.hdf5"
-                shutil.copy(args.temp, backup_name) # TODO: fix backup logic to clear merge and clear single runs
-                print(f"[INFO] Backup saved: {backup_name}")
+                os.remove(args.output)
+                shutil.copy(args.temp, args.output)
+                print(f"[INFO] Marathon updated: {args.output}")
 
                 if run_no % 10 == 0:
                     pass

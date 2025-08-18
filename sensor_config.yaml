@@ -26,7 +26,7 @@ camera:
     yaw: 0.0
     roll: 0.0
   attributes:
-    image_size_x: 320
-    image_size_y: 240
-    fov: 90.0
+    image_size_x: 1024
+    image_size_y: 256
+    fov: 120.0
     sensor_tick: 0.1
