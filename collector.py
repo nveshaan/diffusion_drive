@@ -212,12 +212,23 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
                     i += 1               
 
     finally:
-        for actor in [ego] + sensors:
+        for actor in sensors:
             try:
                 if actor is not None and actor.is_alive:
                     actor.destroy()
             except RuntimeError:
-                pass
+                print("[WARN] Could not destry sensor")
+        for actor in actors:
+            try:
+                if actor is not None and actor.is_alive:
+                    actor.destroy()
+            except RuntimeError:
+                print("[WARN] Could not destroy traffic")
+        try:
+            if ego is not None and ego.is_alive:
+                ego.destroy()
+        except RuntimeError:
+            print("[WARN] Could not destroy ego")
         time.sleep(1.0)
 
 def main():
@@ -247,7 +258,7 @@ def main():
                 # Start traffic generator as a subprocess for this run
                 gen_script = 'python generate_traffic.py --asynch'
                 try:
-                    traffic_proc = subprocess.Popen(gen_script, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    traffic_proc = subprocess.Popen(gen_script, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     print(f"[INFO] Started traffic generator (pid={traffic_proc.pid}) for run {run_no}")
                 except Exception as e:
                     print(f"[WARN] Could not start traffic generator: {e}")
@@ -271,7 +282,7 @@ def main():
                 print(f"Run {run_no} failed: {e}")
                 with open("failed_runs.log", "a") as log:
                     log.write(f"Run {run_no} failed: {e}\n")
-                    
+
             finally:
                 # Ensure traffic generator subprocess is stopped after each run
                 if traffic_proc is not None:
