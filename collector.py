@@ -5,12 +5,10 @@ import numpy as np
 import h5py
 import queue
 import yaml
-import shutil
 import argparse
 import os
 import subprocess
 import psutil
-import signal
 from tqdm import tqdm
 
 FPS = 10
@@ -73,7 +71,7 @@ def parse_args():
     parser.add_argument('--map', type=str, default='Town10', help='CARLA map name')
     parser.add_argument('--vehicle', type=str, default='vehicle.nissan.patrol', help='Vehicle blueprint ID')
     parser.add_argument('--output', type=str, default='marathon.hdf5', help='Final HDF5 output file path')
-    parser.add_argument('--temp', type=str, default='sprint.hdf5', help='Temporary HDF5 path for intermediate storage')
+    parser.add_argument('--temp', type=str, default='data/sprint.hdf5', help='Temporary HDF5 path for intermediate storage')
     parser.add_argument('--no-progress', action='store_true', help='Disable tqdm progress bars for supervised runs')
     return parser.parse_args()
 
@@ -170,6 +168,9 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
                 command, waypoint = tm.get_next_action(ego)
                 command = COMMAND_MAP.get(str(command).upper(), -1)
 
+                base, ext = os.path.splitext(args.temp)
+                temp_file_for_run = f"{base}_{run_no}{ext}"
+
                 data = [
                     image, laser,
                     [velocity.x, velocity.y, velocity.z],
@@ -179,7 +180,7 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
                     [control.throttle, control.steer, control.brake, control.reverse],
                     [command],
                 ]
-                save_data_hdf5(args.temp, run_no, 'vehicles', 'ego', data)
+                save_data_hdf5(temp_file_for_run, run_no, 'vehicles', 'ego', data)
 
                 i = 0
                 for vehicle in vehicles:
@@ -194,7 +195,7 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
                             [rotation.pitch, rotation.yaw, rotation.roll],
                             [extent.x, extent.y, extent.z]]
                     
-                    save_data_hdf5(args.temp, run_no, 'vehicles', i, data)
+                    save_data_hdf5(temp_file_for_run, run_no, 'vehicles', i, data)
                     i += 1
 
                 i = 0
@@ -208,7 +209,7 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
                             [location.x, location.y, location.z],
                             [rotation.pitch, rotation.yaw, rotation.roll],]
                     
-                    save_data_hdf5(args.temp+run_no, run_no, 'walkers', i, data)
+                    save_data_hdf5(temp_file_for_run, run_no, 'walkers', i, data)
                     i += 1               
 
     finally:
@@ -264,18 +265,17 @@ def kill_traffic():
 def main():
     args = parse_args()
 
-    with open("failed_runs.log", "w") as log:
-        log.write(f"\n\n---{time.time()}---\n")
-
-    if os.path.exists(args.temp):
-        print("Removing existing temporary HDF5 file...")
-        os.remove(args.temp)
+    for run in range(1, args.runs+1):
+        base, ext = os.path.splitext(args.temp)
+        temp_file_for_run = f"{base}_{run}{ext}"
+        if not os.path.exists(temp_file_for_run):
+            run_no = run
+            break
 
     with open('sensor_config.yaml', 'r') as file:
         sensor_config = yaml.safe_load(file)
 
     try:
-        run_no = 1
         while run_no <= args.runs:
             launch_carla()
             time.sleep(30)
@@ -289,6 +289,7 @@ def main():
             blueprint_library = world.get_blueprint_library()
 
             traffic_proc = None
+            failed = False
             try:
                 # Start traffic generator as a subprocess for this run
                 gen_script = 'python generate_traffic.py --asynch'
@@ -304,6 +305,10 @@ def main():
             except Exception as e:
                 print(f"Run {run_no} failed: {e}")
                 print(f"Retrying...")
+                base, ext = os.path.splitext(args.temp)
+                temp_file_for_run = f"{base}_{run_no}{ext}"
+                if os.path.exists(temp_file_for_run):
+                    os.remove(temp_file_for_run)
                 failed = True
 
             finally:
