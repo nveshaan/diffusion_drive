@@ -208,7 +208,7 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
                             [location.x, location.y, location.z],
                             [rotation.pitch, rotation.yaw, rotation.roll],]
                     
-                    save_data_hdf5(args.temp, run_no, 'walkers', i, data)
+                    save_data_hdf5(args.temp+run_no, run_no, 'walkers', i, data)
                     i += 1               
 
     finally:
@@ -301,45 +301,10 @@ def main():
 
                 collect_data(world, tm, blueprint_library, run_no, args, sensor_config)
 
-                # Update main output with this run's temp file
-                if os.path.exists(args.output):
-                    try:
-                        os.remove(args.output)
-                    except Exception as e:
-                        print(f"[WARN] Failed to remove existing output {args.output}: {e}")
-                try:
-                    shutil.copy(args.temp, args.output)
-                    print(f"[INFO] Marathon updated: {args.output}")
-                except Exception as e:
-                    print(f"[ERROR] Failed to copy temp to output: {e}")
-
             except Exception as e:
                 print(f"Run {run_no} failed: {e}")
                 print(f"Retrying...")
-                with open("failed_runs.log", "a") as log:
-                    log.write(f"Run {run_no} failed: {e}\n")
-                
-                if os.path.exists(args.temp):
-                    os.remove(args.temp)
-                
-                try:
-                    shutil.move(args.output, args.temp)
-                    print(f"[INFO] Cleaned temp file: {args.temp}")
-                except Exception as e:
-                    print(f"[ERROR] Failed to clean temp: {e}")
-
-                if traffic_proc is not None:
-                    kill_traffic()
-                    print(f"[INFO] Traffic generator (pid={traffic_proc.pid}) killed successfully")
-
-                tm.shut_down()
-                world = None
-                client = None
-                kill_carla()
-                time.sleep(10)
-                print(f"[INFO] Restarting CARLA Server for run {run_no}")
-
-                continue
+                failed = True
 
             finally:
                 # Ensure traffic generator subprocess is stopped after each run
@@ -352,8 +317,13 @@ def main():
                 client = None
                 kill_carla()
                 time.sleep(10)
-                print(f"[INFO] Stopped CARLA Server for run {run_no}")
-                run_no += 1
+
+                if(failed):
+                    print(f"[INFO] Restarting CARLA Server for run {run_no}")
+                    failed = False
+                else:
+                    print(f"[INFO] Stopped CARLA Server for run {run_no}")
+                    run_no += 1
     finally:
         kill_carla()
         time.sleep(30)
