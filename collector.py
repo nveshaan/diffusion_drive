@@ -9,7 +9,7 @@ import shutil
 import argparse
 import os
 import subprocess
-import sys
+import psutil
 import signal
 from tqdm import tqdm
 
@@ -72,8 +72,8 @@ def parse_args():
     parser.add_argument('--runs', type=int, default=100, help='Number of runs to perform')
     parser.add_argument('--map', type=str, default='Town10', help='CARLA map name')
     parser.add_argument('--vehicle', type=str, default='vehicle.nissan.patrol', help='Vehicle blueprint ID')
-    parser.add_argument('--output', type=str, default='/Marsupium/marathon.hdf5', help='Final HDF5 output file path')
-    parser.add_argument('--temp', type=str, default='/Marsupium/sprint.hdf5', help='Temporary HDF5 path for intermediate storage')
+    parser.add_argument('--output', type=str, default='marathon.hdf5', help='Final HDF5 output file path')
+    parser.add_argument('--temp', type=str, default='sprint.hdf5', help='Temporary HDF5 path for intermediate storage')
     parser.add_argument('--no-progress', action='store_true', help='Disable tqdm progress bars for supervised runs')
     return parser.parse_args()
 
@@ -134,6 +134,10 @@ def spawn_vehicle_or_walker(world, blueprint_library, type):
     return world.spawn_actor(type, spawn_point)
 
 def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
+    actors = world.get_actors()
+    vehicles = actors.filter('*vehicle*')
+    walkers = actors.filter('*walker*')
+    
     ego = spawn_vehicle_or_walker(world, blueprint_library, blueprint_library.find(args.vehicle))
     if ego is None:
         raise RuntimeError("Failed to spawn vehicle.")
@@ -141,10 +145,6 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
     sensors = spawn_sensors(world, blueprint_library, sensor_config, [ego])
     if any(s is None for s in sensors):
         raise RuntimeError("Failed to spawn one or more sensors.")
-    
-    actors = world.get_actors()
-    vehicles = actors.filter('*vehicle*')
-    walkers = actors.filter('*walker*')
     
     try:
         with CarlaSyncMode(world, *sensors, fps=FPS) as sync_mode:
@@ -231,6 +231,36 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
             print("[WARN] Could not destroy ego")
         time.sleep(1.0)
 
+def launch_carla():
+    return subprocess.Popen(
+        ["C:\\Program Files\\CARLA\\v9.15\\CarlaUE4.exe", "-RenderOffScreen", "--quality=low"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+def kill_carla():
+    """Terminate any running Carla Unreal Engine processes."""
+    for proc in psutil.process_iter(['cmdline']):
+        try:
+            if proc.info['cmdline'] and 'C:\\Program Files\\CARLA\\v9.15\\CarlaUE4.exe' in proc.info['cmdline']:
+                proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    for proc in psutil.process_iter(['cmdline']):
+        try:
+            if proc.info['cmdline'] and 'CarlaUE4' in proc.info['cmdline']:
+                proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+def kill_traffic():
+    """Terminate any running Carla Unreal Engine processes."""
+    for proc in psutil.process_iter(['cmdline']):
+        try:
+            if proc.info['cmdline'] and ('python generate_traffic.py --asynch' or 'generate_traffic.py') in proc.info['cmdline']:
+                proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
 def main():
     args = parse_args()
 
@@ -245,14 +275,19 @@ def main():
         sensor_config = yaml.safe_load(file)
 
     try:
-        client = carla.Client('192.168.212.250', 2000)
-        client.set_timeout(10.0)
-        # world = client.load_world(args.map)
-        world = client.get_world()
-        tm = client.get_trafficmanager()
-        blueprint_library = world.get_blueprint_library()
+        run_no = 1
+        while run_no <= args.runs:
+            launch_carla()
+            time.sleep(30)
+            print(f"[INFO] Started CARLA Server for run {run_no}")
 
-        for run_no in range(1, args.runs + 1):
+            client = carla.Client('localhost', 2000)
+            client.set_timeout(10.0)
+            # world = client.load_world(args.map)
+            world = client.get_world()
+            tm = client.get_trafficmanager()
+            blueprint_library = world.get_blueprint_library()
+
             traffic_proc = None
             try:
                 # Start traffic generator as a subprocess for this run
@@ -280,29 +315,48 @@ def main():
 
             except Exception as e:
                 print(f"Run {run_no} failed: {e}")
+                print(f"Retrying...")
                 with open("failed_runs.log", "a") as log:
                     log.write(f"Run {run_no} failed: {e}\n")
+                
+                if os.path.exists(args.temp):
+                    os.remove(args.temp)
+                
+                try:
+                    shutil.move(args.output, args.temp)
+                    print(f"[INFO] Cleaned temp file: {args.temp}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to clean temp: {e}")
+
+                if traffic_proc is not None:
+                    kill_traffic()
+                    print(f"[INFO] Traffic generator (pid={traffic_proc.pid}) killed successfully")
+
+                tm.shut_down()
+                world = None
+                client = None
+                kill_carla()
+                time.sleep(10)
+                print(f"[INFO] Restarting CARLA Server for run {run_no}")
+
+                continue
 
             finally:
                 # Ensure traffic generator subprocess is stopped after each run
                 if traffic_proc is not None:
-                    try:
-                        # try a graceful interrupt first
-                        traffic_proc.send_signal(signal.SIGINT)
-                        traffic_proc.wait(timeout=10)
-                        print(f"[INFO] Traffic generator (pid={traffic_proc.pid}) stopped gracefully")
-                    except Exception:
-                        try:
-                            traffic_proc.terminate()
-                            traffic_proc.wait(timeout=10)
-                            print(f"[INFO] Traffic generator (pid={traffic_proc.pid}) terminated")
-                        except Exception:
-                            try:
-                                traffic_proc.kill()
-                                print(f"[INFO] Traffic generator (pid={traffic_proc.pid}) killed")
-                            except Exception as e:
-                                print(f"[WARN] Failed to kill traffic generator: {e}")
+                    kill_traffic()
+                    print(f"[INFO] Traffic generator (pid={traffic_proc.pid}) killed successfully")
+
+                tm.shut_down()
+                world = None
+                client = None
+                kill_carla()
+                time.sleep(10)
+                print(f"[INFO] Stopped CARLA Server for run {run_no}")
+                run_no += 1
     finally:
+        kill_carla()
+        time.sleep(30)
         print("Shutdown complete.")
 
 if __name__ == '__main__':
