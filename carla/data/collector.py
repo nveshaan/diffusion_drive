@@ -79,18 +79,16 @@ def save_data_hdf5(file, run, actor, ego, data):
     try:
         with h5py.File(file, 'a') as f:
             run_group = f.require_group(f"runs/{run}")
-            vehicle_group = run_group.require_group(f"{actor}/{ego}")
+            sub_group = run_group.require_group(f"{actor}/{ego}")
             if ego == 'ego':
                 dataset_names = ["image", "laser", "velocity", "acceleration", "location", "rotation", "control", "command"]
-            elif actor == 'vehicles':
-                dataset_names = ["velocity", "acceleration", "location", "rotation", "extent"]
             else:
-                dataset_names = ["velocity", "acceleration", "location", "rotation"]
+                dataset_names = ["velocity", "acceleration", "location", "rotation", "extent"]
 
             for ds_name, d in zip(dataset_names, data):
                 d = np.array(d)
-                if ds_name in vehicle_group:
-                    ds = vehicle_group[ds_name]
+                if ds_name in sub_group:
+                    ds = sub_group[ds_name]
                     if ds.shape[1:] != d.shape:
                         print(f"[ERROR] Shape mismatch for '{ds_name}': existing {ds.shape[1:]}, incoming {d.shape}. Skipping.")
                         continue
@@ -98,7 +96,7 @@ def save_data_hdf5(file, run, actor, ego, data):
                     ds[-1] = d
                 else:
                     maxshape = (None,) + d.shape
-                    vehicle_group.create_dataset(ds_name, data=d[None], maxshape=maxshape, chunks=True)
+                    sub_group.create_dataset(ds_name, data=d[None], maxshape=maxshape, chunks=True)
             f.flush()
 
     except Exception as e:
@@ -203,12 +201,14 @@ def collect_data(world, tm, blueprint_library, run_no, args, sensor_config):
                     velocity = walker.get_velocity()
                     acceleration = walker.get_acceleration()
                     location, rotation = walker.get_transform().location, walker.get_transform().rotation
+                    extent = walker.bounding_box.extent
 
                     data = [[velocity.x, velocity.y, velocity.z],
                             [acceleration.x, acceleration.y, acceleration.z],
                             [location.x, location.y, location.z],
-                            [rotation.pitch, rotation.yaw, rotation.roll],]
-                    
+                            [rotation.pitch, rotation.yaw, rotation.roll],
+                            [extent.x, extent.y, extent.z]]
+
                     save_data_hdf5(temp_file_for_run, run_no, 'walkers', i, data)
                     i += 1               
 

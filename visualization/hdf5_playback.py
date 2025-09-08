@@ -13,7 +13,7 @@ def count_run_with_collisions(file):
     return count
 
 # === CONFIGURATION ===
-file_path = '/Volumes/New Volume/data/sprint_50.hdf5'
+file_path = '/Volumes/New Volume/data/sprint_20.hdf5'
 with h5py.File(file_path, 'r') as f:
     print(f"No. of runs: {len(f['runs'])}")
     print(f"Runs with collisions: {count_run_with_collisions(f)}")

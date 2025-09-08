@@ -38,7 +38,7 @@ def global_to_ego_2d(global_points, ego_position, ego_yaw_deg):
 file_path = '/Volumes/New Volume/marathon.hdf5'
 obs_horizon = 8
 obs_stride = 5
-skip = 0
+skip = 10
 
 index_map = []
 total_frames = 500
