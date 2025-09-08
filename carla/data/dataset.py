@@ -5,10 +5,8 @@ import numpy as np
 from math import pi
 import cv2
 
-from navsim.agents.transfuser.transfuser_config import TransfuserConfig
-
 class SampleData(Dataset):
-    def __init__(self, file_path, num_poses, stride, gap, skip=150):
+    def __init__(self, file_path, gap=0, num_poses=8, stride=5, skip=150):
         super().__init__()
         self.file_path = file_path
         self.file = None
@@ -28,6 +26,18 @@ class SampleData(Dataset):
 
                 for i in range(self.skip, max_index):
                     self.index_map.append((run_key, i))
+
+        self.max_height_lidar: float = 100.0
+        self.pixels_per_meter: float = 4.0
+        self.hist_max_per_pixel: int = 5
+
+        self.lidar_min_x: float = -32
+        self.lidar_max_x: float = 32
+        self.lidar_min_y: float = -32
+        self.lidar_max_y: float = 32
+
+        self.lidar_split_height: float = 0.2
+        self.use_ground_plane: bool = False
 
     def __len__(self) -> int:
         return len(self.index_map)
@@ -56,69 +66,115 @@ class SampleData(Dataset):
             elif key == 'laser':
                 features.update({'lidar_feature': torch.stack([self._get_lidar_feature(data[i]) for i in idxs]).squeeze()})
             elif key == 'velocity':
-                velocity = np.array(data[idxs]).squeeze().norm()
+                v = np.array(data[idxs]).squeeze()
+                # Use 2D speed if available; fallback to full norm
+                velocity = float(np.linalg.norm(v[:2] if v.shape[-1] >= 2 else v))
             elif key == 'acceleration':
-                acceleration = np.array(data[idxs]).squeeze().norm()
+                a = np.array(data[idxs]).squeeze()
+                acceleration = float(np.linalg.norm(a[:2] if a.shape[-1] >= 2 else a))
             elif key == 'command':
                 command = np.array(data[idxs]).squeeze()
 
         features.update({'status_feature': torch.tensor([command, command, command, command, velocity, velocity, acceleration, acceleration], dtype=torch.float32).unsqueeze(0)})
 
         pred_start = start_idx + self.gap
-        for key in self.target_keys:
-            ego_data = run['vehicles/ego/'+key]
-            idxs = [pred_start + i * self.stride for i in range(self.num_poses)]
-            if key == 'location':
-                targets.update({'trajectory': torch.tensor(self._global_to_ego_2d(np.array(ego_data[idxs]), np.array(ego_data[start_idx]), np.array(run['vehicles/ego/rotation'][start_idx][1])), dtype=torch.float32).squeeze()})
-            else:
-                vehicles = [v for v in run['vehicles'] if v != 'ego']
-                vehicles_location = []
-                vehicles_yaw = []
-                vehicles_extent = []
-                if len(vehicles) > 0:
-                    for vehicle in vehicles:
-                        vehicle_data = run['vehicles/'+vehicle+'/'+key]
-                        vehicles_location.append(torch.tensor(self._global_to_ego_2d(np.array(vehicle_data[start_idx]), np.array(ego_data[start_idx]), np.array(run['vehicles/ego/rotation'][start_idx][1])), dtype=torch.float32).unsqueeze(0))
-                        vehicles_yaw.append(torch.tensor(run['vehicles/'+vehicle+'/rotation'][start_idx][1], dtype=torch.float32).unsqueeze(0))
-                        vehicles_extent.append(torch.tensor(run['vehicles/'+vehicle+'/extent'][start_idx], dtype=torch.float32).unsqueeze(0))
+        # Build targets
+        # 1) Trajectory (ego frame)
+        ego_loc_ds = run['vehicles/ego/location']
+        idxs = [pred_start + i * self.stride for i in range(self.num_poses)]
+        ego_traj_global = np.array(ego_loc_ds[idxs])
+        ego_start_global = np.array(ego_loc_ds[start_idx])
+        ego_yaw_deg = float(run['vehicles/ego/rotation'][start_idx][1])
+        traj_xy = self._global_to_ego_2d(ego_traj_global, ego_start_global, ego_yaw_deg)
+        targets.update({'trajectory': torch.tensor(traj_xy, dtype=torch.float32)})
 
-                walkers = [w for w in run['walkers']]
-                walkers_location = []
-                walkers_yaw = []
-                walkers_extent = []
-                if len(walkers) > 0:
-                    for walker in walkers:
-                        walker_data = run['walkers/'+walker+'/'+key]
-                        walkers_location.append(torch.tensor(self._global_to_ego_2d(np.array(walker_data[start_idx]), np.array(ego_data[start_idx]), np.array(run['vehicles/ego/rotation'][start_idx][1])), dtype=torch.float32).unsqueeze(0))
-                        walkers_yaw.append(torch.tensor(run['walkers/'+walker+'/rotation'][start_idx][1], dtype=torch.float32).unsqueeze(0))
-                        walkers_extent.append(torch.tensor(run['walkers/'+walker+'/extent'][start_idx], dtype=torch.float32).unsqueeze(0))
+        # 2) Agents: filter with _xy_in_lidar, select nearest 30, pad
+        def _xy_in_lidar(x: float, y: float) -> bool:
+            return (self.lidar_min_x <= x <= self.lidar_max_x) and (self.lidar_min_y <= y <= self.lidar_max_y)
 
-                distances = np.linalg.norm(np.array(ego_data[start_idx][:2]) - np.array([loc.numpy()[:2] for loc in vehicles_location + walkers_location]), axis=1) if (len(vehicles_location) + len(walkers_location)) > 0 else np.array([])
-                argsort = np.argsort(distances)[:30]
-                agent_location = np.concat(vehicles_location + walkers_location, dim=0) if (len(vehicles_location) + len(walkers_location)) > 0 else torch.zeros((0, 3), dtype=torch.float32)
-                agent_yaw = np.concat(vehicles_yaw + walkers_yaw, dim=0) if (len(vehicles_yaw) + len(walkers_yaw)) > 0 else torch.zeros((0,), dtype=torch.float32)
-                agent_extent = np.concat(vehicles_extent + walkers_extent, dim=0) if (len(vehicles_extent) + len(walkers_extent)) > 0 else torch.zeros((0, 3), dtype=torch.float32)
-                if len(argsort) > 0:
-                    agent_location = agent_location[argsort]
-                    agent_yaw = agent_yaw[argsort]
-                    agent_extent = agent_extent[argsort]
-                    agent_labels = torch.ones((30,), dtype=torch.int64)[argsort].unsqueeze(0)
-                if len(argsort) < 30:
-                    padding = 30 - len(argsort)
-                    agent_location = torch.cat([agent_location, torch.zeros((padding, 3), dtype=torch.float32)], dim=0)
-                    agent_yaw = torch.cat([agent_yaw, torch.zeros((padding,), dtype=torch.float32)], dim=0)
-                    agent_extent = torch.cat([agent_extent, torch.zeros((padding, 3), dtype=torch.float32)], dim=0)
-                    agent_labels = torch.cat([torch.ones((len(argsort),), dtype=torch.int64), torch.zeros((padding,), dtype=torch.int64)], dim=0).unsqueeze(0)
+        agent_pos_list = []
+        agent_yaw_list = []
+        agent_len_list = []
+        agent_wid_list = []
+        agent_label_list = []
 
-                agent_states = torch.cat([agent_location[:0].unsqueeze(0), agent_location[:1].unsqueeze(0), agent_yaw.unsqueeze(1), agent_extent*2[:, 0].unsqueeze(1), agent_extent*2[:, 1].unsqueeze(1)], dim=1)
-                targets.update({'agent_states': agent_states})
-                targets.update({'agent_labels': agent_labels})
+        # Collect vehicles (exclude ego)
+        vehicles = [v for v in run['vehicles'] if v != 'ego']
+        for vehicle in vehicles:
+            v_loc = np.array(run[f'vehicles/{vehicle}/location'][start_idx])
+            rel_xy = self._global_to_ego_2d(np.array([v_loc]), ego_start_global, ego_yaw_deg)[0]
+            if not _xy_in_lidar(float(rel_xy[0]), float(rel_xy[1])):
+                continue
+            v_yaw_deg = float(run[f'vehicles/{vehicle}/rotation'][start_idx][1])
+            # relative yaw in radians, wrapped to [-pi, pi]
+            yaw_rel = np.deg2rad(v_yaw_deg - ego_yaw_deg)
+            yaw_rel = (yaw_rel + np.pi) % (2 * np.pi) - np.pi
+            extent = np.array(run[f'vehicles/{vehicle}/extent'][start_idx])  # (ex, ey, ez) half-sizes
+            agent_pos_list.append(rel_xy.astype(np.float32))
+            agent_yaw_list.append(np.float32(yaw_rel))
+            agent_len_list.append(np.float32(extent[0] * 2.0))
+            agent_wid_list.append(np.float32(extent[1] * 2.0))
+            agent_label_list.append(1)  # vehicle
 
-                bev_semantic_map = np.zeros(self._config.bev_semantic_frame, dtype=np.int64)
-                entity_mask = self._compute_box_mask(annotations, laye
-                def _xy_in_lidar(x: float, y: float) -> bool:
-                    return (self.lidar_min_x <= x <= self.lidar_max_x) and (self.lidar_min_y <= y <= self.lidar_max_y)r
-                   bev_semantic_map[entity_mask] = label
+        # Collect walkers (if present)
+        walkers = [w for w in run['walkers']]
+        for walker in walkers:
+            w_loc = np.array(run[f'walkers/{walker}/location'][start_idx])
+            rel_xy = self._global_to_ego_2d(np.array([w_loc]), ego_start_global, ego_yaw_deg)[0]
+            if not _xy_in_lidar(float(rel_xy[0]), float(rel_xy[1])):
+                continue
+            w_yaw_deg = float(run[f'walkers/{walker}/rotation'][start_idx][1])
+            yaw_rel = np.deg2rad(w_yaw_deg - ego_yaw_deg)
+            yaw_rel = (yaw_rel + np.pi) % (2 * np.pi) - np.pi
+            extent = np.array(run[f'walkers/{walker}/extent'][start_idx])
+            agent_pos_list.append(rel_xy.astype(np.float32))
+            agent_yaw_list.append(np.float32(yaw_rel))
+            agent_len_list.append(np.float32(extent[0] * 2.0))
+            agent_wid_list.append(np.float32(extent[1] * 2.0))
+            agent_label_list.append(2)  # pedestrian
+
+        if len(agent_pos_list) > 0:
+            pos = torch.tensor(np.stack(agent_pos_list, axis=0), dtype=torch.float32)          # (N,2)
+            yaw = torch.tensor(np.array(agent_yaw_list), dtype=torch.float32)                  # (N,)
+            length = torch.tensor(np.array(agent_len_list), dtype=torch.float32)               # (N,)
+            width = torch.tensor(np.array(agent_wid_list), dtype=torch.float32)                # (N,)
+            label = torch.tensor(np.array(agent_label_list), dtype=torch.int64)               # (N,)
+            # nearest by ego-frame distance
+            distances = torch.linalg.norm(pos, dim=1)
+            order = torch.argsort(distances)[:30]
+            pos = pos[order]
+            yaw = yaw[order]
+            length = length[order]
+            width = width[order]
+            label = label[order]
+            count = pos.shape[0]
+        else:
+            pos = torch.zeros((0, 2), dtype=torch.float32)
+            yaw = torch.zeros((0,), dtype=torch.float32)
+            length = torch.zeros((0,), dtype=torch.float32)
+            width = torch.zeros((0,), dtype=torch.float32)
+            label = torch.zeros((0,), dtype=torch.int64)
+            count = 0
+
+        # pad to 30
+        pad = max(0, 30 - count)
+        if pad > 0:
+            pos = torch.cat([pos, torch.zeros((pad, 2), dtype=torch.float32)], dim=0)
+            yaw = torch.cat([yaw, torch.zeros((pad,), dtype=torch.float32)], dim=0)
+            length = torch.cat([length, torch.zeros((pad,), dtype=torch.float32)], dim=0)
+            width = torch.cat([width, torch.zeros((pad,), dtype=torch.float32)], dim=0)
+            label = torch.cat([label, torch.zeros((pad,), dtype=torch.int64)], dim=0)
+        agent_states = torch.cat([pos, yaw.unsqueeze(1), length.unsqueeze(1), width.unsqueeze(1), label.unsqueeze(1)], dim=1)  # (30,5)
+        agent_labels = torch.zeros((30,), dtype=torch.bool)
+        if count > 0:
+            agent_labels[:count] = True
+
+        # 3) BEV semantic map of agents (binary), from agent_states
+        bev_semantic_map = self._compute_box_mask(agent_states.numpy())
+
+        targets.update({'bev_semantic_map': torch.tensor(bev_semantic_map.astype(np.float32)).unsqueeze(0)})
+        targets.update({'agent_states': agent_states[:, :4]})  # (x,y,yaw,len,wid), ignore label
+        targets.update({'agent_labels': agent_labels})
 
         return (features, targets)
 
@@ -131,7 +187,7 @@ class SampleData(Dataset):
         cos_yaw = np.cos(ego_yaw_rad)
         sin_yaw = np.sin(ego_yaw_rad)
 
-        rotation_ np.array([ 
+        rotation_matrix = np.array([
             [ cos_yaw,  sin_yaw],
             [ sin_yaw, -cos_yaw],
         ])
@@ -153,26 +209,26 @@ class SampleData(Dataset):
         def splat_points(point_cloud):
             # 256 x 256 grid
             xbins = np.linspace(
-                self._config.lidar_min_x,
-                self._config.lidar_max_x,
-                (self._config.lidar_max_x - self._config.lidar_min_x) * int(self._config.pixels_per_meter) + 1,
+                self.lidar_min_x,
+                self.lidar_max_x,
+                (self.lidar_max_x - self.lidar_min_x) * int(self.pixels_per_meter) + 1,
             )
             ybins = np.linspace(
-                self._config.lidar_min_y,
-                self._config.lidar_max_y,
-                (self._config.lidar_max_y - self._config.lidar_min_y) * int(self._config.pixels_per_meter) + 1,
+                self.lidar_min_y,
+                self.lidar_max_y,
+                (self.lidar_max_y - self.lidar_min_y) * int(self.pixels_per_meter) + 1,
             )
             hist = np.histogramdd(point_cloud[:, :2], bins=(xbins, ybins))[0]
-            hist[hist > self._config.hist_max_per_pixel] = self._config.hist_max_per_pixel
-            overhead_splat = hist / self._config.hist_max_per_pixel
+            hist[hist > self.hist_max_per_pixel] = self.hist_max_per_pixel
+            overhead_splat = hist / self.hist_max_per_pixel
             return overhead_splat
 
         # Remove points above the vehicle
-        lidar_pc = lidar_pc[lidar_pc[..., 2] < self._config.max_height_lidar]
-        below = lidar_pc[lidar_pc[..., 2] <= self._config.lidar_split_height]
-        above = lidar_pc[lidar_pc[..., 2] > self._config.lidar_split_height]
+        lidar_pc = lidar_pc[lidar_pc[..., 2] < self.max_height_lidar]
+        below = lidar_pc[lidar_pc[..., 2] <= self.lidar_split_height]
+        above = lidar_pc[lidar_pc[..., 2] > self.lidar_split_height]
         above_features = splat_points(above)
-        if self._config.use_ground_plane:
+        if self.use_ground_plane:
             below_features = splat_points(below)
             features = np.stack([below_features, above_features], axis=-1)
         else:
@@ -181,27 +237,36 @@ class SampleData(Dataset):
 
         return torch.tensor(features)
     
-    def _compute_box_mask(self, annotations, layers):
+    def _compute_box_mask(self, agent_states):
         """
-        Compute binary of bounding boxes in BEV space
-        :param annotations: annotation dataclass
-        :param layers: bounding box labels to include
-        :return: binary mask as numpy array
+        Compute BEV semantic map with different integer values for different classes
+        :param agent_states: (N,6) numpy array of (x,y,yaw,len,wid,label)
+        :return: BEV semantic map as numpy array
         """
-        box_polygon_mask = np.zeros(self._config.bev_semantic_frame[::-1], dtype=np.uint8)
-        for name_value, box_value in zip(annotations.names, annotations.boxes):
-            agent_type = tracked_object_types[name_value]
-            if agent_type in layers:
-                # box_value = (x, y, z, length, width, height, yaw) TODO: add intenum
-                x, y, heading = box_value[0], box_value[1], box_value[-1]
-                box_length, box_width, box_height = box_value[3], box_value[4], box_value[5]
-                agent_box = OrientedBox(StateSE2(x, y, heading), box_length, box_width, box_height)
-                exterior = np.array(agent_box.geometry.exterior.coords).reshape((-1, 1, 2))
-                exterior = self._coords_to_pixel(exterior)
-                cv2.fillPoly(box_polygon_mask, [exterior], color=255)
-        # OpenCV has origin on top-left corner
-        box_polygon_mask = np.rot90(box_polygon_mask)[::-1]
-        return box_polygon_mask > 0
+        bev_semantic_map = np.zeros(self.bev_semantic_frame, dtype=np.int64)
+        box_polygon_mask = np.zeros(self.bev_semantic_frame[::-1], dtype=np.uint8)
+        for agent_state in agent_states:
+            x, y, heading = agent_state[0], agent_state[1], agent_state[2]
+            box_length, box_width, label = agent_state[3], agent_state[4], agent_state[5]
+            # calculate corners of the oriented box
+            cos_h = np.cos(heading)
+            sin_h = np.sin(heading)
+            dx1 = (box_length / 2) * cos_h
+            dy1 = (box_length / 2) * sin_h
+            dx2 = (box_width / 2) * sin_h
+            dy2 = (box_width / 2) * cos_h
+            agent_box = [[x - dx1 - dx2, y - dy1 + dy2],
+                         [x - dx1 + dx2, y - dy1 - dy2],
+                         [x + dx1 + dx2, y + dy1 - dy2],
+                         [x + dx1 - dx2, y + dy1 + dy2]]
+            exterior = np.array(agent_box).reshape((-1, 1, 2))
+            exterior = self._coords_to_pixel(exterior)
+            cv2.fillPoly(box_polygon_mask, [exterior], color=255)
+            # OpenCV has origin on top-left corner
+            box_polygon_mask = np.rot90(box_polygon_mask)[::-1]
+            entity_mask = box_polygon_mask > 0
+            bev_semantic_map[entity_mask] = label  # set to class label
+        return bev_semantic_map
     
     def _coords_to_pixel(self, coords):
         """
@@ -211,8 +276,8 @@ class SampleData(Dataset):
         """
 
         # NOTE: remove half in backward direction
-        pixel_center = np.array([[0, self._config.bev_pixel_width / 2.0]])
-        coords_idcs = (coords / self._config.bev_pixel_size) + pixel_center
+        pixel_center = np.array([[0, self.bev_pixel_width / 2.0]])
+        coords_idcs = (coords / self.bev_pixel_size) + pixel_center
 
         return coords_idcs.astype(np.int32)
 

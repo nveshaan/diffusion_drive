@@ -14,6 +14,8 @@ from navsim.common.dataclasses import SceneFilter
 from navsim.planning.training.dataset import CacheOnlyDataset, Dataset
 from navsim.planning.training.agent_lightning_module import AgentLightningModule
 
+from carla.data.dataset import SampleData as CarlaDataset
+
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/training"
@@ -119,7 +121,7 @@ def main(cfg: DictConfig) -> None:
         )
     else:
         logger.info("Building SceneLoader")
-        train_data, val_data = build_datasets(cfg, agent)
+        train_data, val_data = CarlaDataset(file_path="/Volumes/New Volume/marathon.hdf5", gap=0, num_poses=8, stride=5, skip=150), CarlaDataset(file_path="/Volumes/New Volume/marathon.hdf5", gap=0, num_poses=8, stride=5, skip=150)
 
     logger.info("Building Datasets")
     train_dataloader = DataLoader(train_data, **cfg.dataloader.params, shuffle=True)
